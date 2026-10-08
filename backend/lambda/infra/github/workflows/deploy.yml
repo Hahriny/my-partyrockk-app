@@ -1,0 +1,129 @@
+name: Deploy Learning Steps For Autistic Kids
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build & Deploy to AWS
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Configure AWS credentials ─────────────────────────────────────
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ap-southeast-1
+
+      # ── 3. Set up Python 3.12 ────────────────────────────────────────────
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # ── 4. Set up AWS SAM CLI ────────────────────────────────────────────
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      # ── 5. Fix shell script line endings and permissions ─────────────────
+      - name: Fix run.sh scripts
+        run: |
+          find backend -name "run.sh" -exec sed -i 's/\r$//' {} \;
+          find backend -name "run.sh" -exec chmod +x {} \;
+
+      # ── 6. SAM Build ─────────────────────────────────────────────────────
+      - name: SAM Build
+        run: sam build --template infra/template.yaml
+
+      # ── 6. SAM Deploy ────────────────────────────────────────────────────
+      - name: SAM Deploy
+        run: |
+          sam deploy \
+            --stack-name learning-steps-for-autistics-kids \
+            --s3-bucket ${{ secrets.SAM_DEPLOY_BUCKET }} \
+            --capabilities CAPABILITY_IAM CAPABILITY_NAMED_IAM \
+            --region ap-southeast-1 \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset || {
+              echo "=== STACK EVENTS (failures) ==="
+              aws cloudformation describe-stack-events \
+                --stack-name learning-steps-for-autistics-kids \
+                --region ap-southeast-1 \
+                --query "StackEvents[?contains(ResourceStatus,'FAILED')].{Resource:LogicalResourceId,Status:ResourceStatus,Reason:ResourceStatusReason}" \
+                --output table
+              exit 1
+            }
+
+      # ── 7. Read CloudFormation outputs & inject into frontend ─────────────
+      - name: Inject API URLs into frontend
+        run: |
+          # Helper function to read a single CloudFormation output value
+          get_output() {
+            aws cloudformation describe-stacks \
+              --stack-name learning-steps-for-autistics-kids \
+              --query "Stacks[0].Outputs[?OutputKey=='$1'].OutputValue" \
+              --output text
+          }
+
+          # Fetch all output values
+          DIAGRAM_URL=$(get_output DiagramApiUrl)
+          LESSON_URL=$(get_output YourLessonUrl)
+          WRITING_URL=$(get_output WritingPracticeUrl)
+          BADGE_URL=$(get_output YourStarBadgeUrl)
+          PARENT_URL=$(get_output ParentandTeacherNotesUrl)
+          HELPER_URL=$(get_output FriendlyLearningHelperUrl)
+          BUCKET_NAME=$(get_output BucketName)
+
+          echo "DiagramApiUrl:             $DIAGRAM_URL"
+          echo "YourLessonUrl:             $LESSON_URL"
+          echo "WritingPracticeUrl:        $WRITING_URL"
+          echo "YourStarBadgeUrl:          $BADGE_URL"
+          echo "ParentandTeacherNotesUrl:  $PARENT_URL"
+          echo "FriendlyLearningHelperUrl: $HELPER_URL"
+          echo "BucketName:                $BUCKET_NAME"
+
+          # Inject placeholders in frontend/index.html
+          sed -i "s|__DIAGRAM_API_URL__|$DIAGRAM_URL|g"               frontend/index.html
+          sed -i "s|__URL_YOUR_LESSON__|$LESSON_URL|g"                frontend/index.html
+          sed -i "s|__URL_WRITING_PRACTICE__|$WRITING_URL|g"          frontend/index.html
+          sed -i "s|__URL_YOUR_STAR_BADGE__|$BADGE_URL|g"             frontend/index.html
+          sed -i "s|__URL_PARENT_AND_TEACHER_NOTES__|$PARENT_URL|g"   frontend/index.html
+          sed -i "s|__URL_FRIENDLY_LEARNING_HELPER__|$HELPER_URL|g"   frontend/index.html
+
+          # Verify substitutions worked (no placeholders left)
+          if grep -q '__URL_' frontend/index.html; then
+            echo "ERROR: Some URL placeholders were not replaced!"
+            grep '__URL_' frontend/index.html
+            exit 1
+          fi
+
+          echo "BUCKET_NAME=$BUCKET_NAME" >> $GITHUB_ENV
+
+      # ── 8. Sync frontend to S3 ───────────────────────────────────────────
+      - name: Upload frontend to S3
+        run: |
+          aws s3 sync frontend/ s3://${{ env.BUCKET_NAME }}/ \
+            --delete \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      # ── 9. Print website URL ─────────────────────────────────────────────
+      - name: Print website URL
+        run: |
+          WEBSITE_URL=$(aws cloudformation describe-stacks \
+            --stack-name learning-steps-for-autistics-kids \
+            --query "Stacks[0].Outputs[?OutputKey=='WebsiteUrl'].OutputValue" \
+            --output text)
+          echo "=========================================="
+          echo "  🌟 App is live at: $WEBSITE_URL"
+          echo "=========================================="
